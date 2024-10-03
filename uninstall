@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+
+OPENWRT=${1:?'No OpenWrt server provided'}
+echo "OPENWRT = ${OPENWRT}"
+
+ssh "${OPENWRT}" "rm -f /etc/hotplug.d/dhcp/cname_updater_hook"
+ssh "${OPENWRT}" "service cname_reaper stop"
+ssh "${OPENWRT}" "service cname_reaper disable"
+
+ssh "${OPENWRT}" "rm -f /tmp/17*.*"
+ssh "${OPENWRT}" "rm -f /tmp/log/cname_reaper.log"
+ssh "${OPENWRT}" "rm -f /etc/init.d/cname_reaper"
+ssh "${OPENWRT}" "rm -f /etc/cname_mappings"
+ssh "${OPENWRT}" "rm -rf /usr/share/cname_updater"

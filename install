@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+
+OPENWRT=${1:?'No OpenWrt server provided'}
+echo "OPENWRT = ${OPENWRT}"
+
+scp "${ENV_MAPPINGS}" "${OPENWRT}:/etc/"
+ssh "${OPENWRT}" 'mkdir -p /usr/share/cname_updater'
+scp "${ENV_HOOK}"  "${OPENWRT}:/etc/hotplug.d/dhcp/"
+scp "${ENV_REAPER}"  "${OPENWRT}:/usr/share/cname_updater/"
+scp "${ENV_UPDATER}"  "${OPENWRT}:/usr/share/cname_updater/"
+scp "${ENV_FUNCTIONS}"  "${OPENWRT}:/usr/share/cname_updater/"
+scp "${ENV_REAPER_INIT}"  "${OPENWRT}:/etc/init.d/cname_reaper"
+
+ssh "${OPENWRT}" 'service cname_reaper enable'
+ssh "${OPENWRT}" 'service cname_reaper start'

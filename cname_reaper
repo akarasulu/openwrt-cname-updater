@@ -1,0 +1,74 @@
+#!/bin/bash
+
+#
+# Service driver to scan and delete aged CNAMEs with unreachable targets in the mapping file
+#
+
+logpri=${1}
+export logpri
+CNAME_REAPER=yes
+export CNAME_REAPER
+
+# shellcheck disable=SC1091
+source /usr/share/cname_updater/functions
+
+log "Variables:"
+log "----"
+log "[RUN] \${FD}        = ${FD}"
+log "[UCI] \${DOMAIN}    = ${DOMAIN}"
+log "[VAR] \${MAPPINGS}  = ${MAPPINGS}"
+log "[VAR] \${LOCK_FILE} = ${LOCK_FILE}"
+log "----"
+
+PERIOD=5
+log "Entering driver while loop"
+while true; do
+  lock # to protect against mangling if the handler is running
+
+  idx=-1
+  deleted=0
+  while true; do
+    # iterate through UCI CNAMEs pinging their targets if in the mapping file
+    cname="$(uci get dhcp.@cname["${idx}"].cname 2>/dev/null)"
+    found_entry=$?
+    cname="${cname%\."${DOMAIN}"}"
+
+    # when the scan is done debounce dnsmasq if entries were deleted
+    if [[ ${found_entry} -ne 0 ]]; then
+      log warn "cname_reaper: deleted ${deleted} entries on scan"
+      if [[ ${deleted} -gt 0 ]]; then
+        log warn "cname_reaper: restarting dnsmasq"
+        service dnsmasq restart
+      fi
+      break
+    fi
+
+    target="$(uci get dhcp.@cname["${idx}"].target)"
+    target="${target%\."${DOMAIN}"}"
+
+    if ! grep -qE "${target}[[:space:]]*${cname}" /etc/cname_mappings; then
+      log debug "cname_reaper: '${cname}' ==> '${target}' not in /etc/cname_mappings, skipping"
+      ((++idx))
+      continue
+    elif host_up "${target}.${DOMAIN}"; then
+      log "cname_reaper: '${cname}' ==> '${target}' in /etc/cname_mappings and target is reachable, skipping"
+      ((++idx))
+      continue
+    fi
+
+    ((++deleted))
+    # not incrementing idx due to delete causing entry shift
+    log warn "cname_reaper: '${cname}' ==> '${target}' in /etc/cname_mappings, with unreachable target, deleting"
+    if uci delete dhcp.@cname["${idx}"]; then
+      log warn "cname_reaper: Deleted '${cname}' ==> '${target}', committing"
+      if ! uci commit dhcp; then
+        revert "cname_reaper: FAILED TO COMMIT ON DELETE OF '${cname}' ==> '${target}', reverting"
+      else
+        log warn "cname_reaper: Succeeded to delete and commit CNAME '${cname}' ==> '${target}'"
+      fi
+    fi
+  done
+
+  unlock
+  sleep ${PERIOD}
+done

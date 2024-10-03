@@ -1,0 +1,181 @@
+#!/bin/bash
+
+# shellcheck disable=SC1091
+source /usr/share/cname_updater/functions
+
+log "Variables:"
+log "----"
+log "[RUN] \${FD}        = ${FD}"
+log "[UCI] \${DOMAIN}    = ${DOMAIN}"
+log "[ENV] \${ACTION}    = ${ACTION}"
+log "[ENV] \${IPADDR}    = ${IPADDR}"
+log "[ENV] \${MACADDR}   = ${MACADDR}"
+log "[ENV] \${HOSTNAME}  = ${HOSTNAME}"
+log "[VAR] \${MAPPINGS}  = ${MAPPINGS}"
+log "[VAR] \${LOCK_FILE} = ${LOCK_FILE}"
+log "----"
+
+if [[ -z ${HOSTNAME} ]]; then
+  log "The HOSTNAME is not set, exiting"
+  exit 1
+fi
+
+# targets provided in the environment do not have the domain suffix appended
+env_target="${HOSTNAME}"
+env_target_domain="${HOSTNAME}.${DOMAIN}"
+log "env_target             = ${env_target}"
+log "env_target_domain      = ${env_target_domain}"
+
+lock # lock before ANY lookup or search to prevent dirty reads
+# quickly lookup a CNAME name by target in the mapping file
+# targets and CNAME names in the mapping file do not append domain suffixes
+map_cname="$(grep -E "^${env_target} .*" "${MAPPINGS}" | cut -d' ' -f2)"
+[[ -z ${map_cname} ]] && log warn "NO MAPPING FOR ${env_target}: EXITING ..." && exit 0
+map_cname_domain="${map_cname}.${DOMAIN}"
+log "map_cname              = ${map_cname}"
+log "map_cname_domain       = ${map_cname_domain}"
+
+# get the preferred reachable target from the mapping file
+map_pref_target="$(pref_mapping "${map_cname}" "${env_target}" "${ACTION}")"
+map_pref_target_exists=$?
+[[ ${map_pref_target_exists} -eq 0 ]] && map_pref_target_domain="${map_pref_target}.${DOMAIN}"
+log "map_pref_target        = ${map_pref_target}"
+log "map_pref_target_exists = ${map_pref_target_exists}"
+log "map_pref_target_domain = ${map_pref_target_domain}"
+
+# targets and CNAME names in the dhcp uci database append domain suffixes
+uci_target_output="$(uci_target "${map_cname_domain}")"
+uci_target_exists=$?
+log "uci_target_output      = ${uci_target_output}"
+log "uci_target_exists      = ${uci_target_exists}"
+
+if [[ ${uci_target_exists} -eq 0 ]]; then
+  uci_target_domain="$(echo "${uci_target_output}" | cut -d ' ' -f1)"
+  uci_target_index="$(echo "${uci_target_output}" | cut -d ' ' -f2)"
+  uci_target=${uci_target_domain%\."${DOMAIN}"}
+fi
+log "uci_target             = ${uci_target}"
+log "uci_target_domain      = ${uci_target_domain}"
+log "uci_target_index       = ${uci_target_index}"
+
+# lock is still on to respond to the ACTION
+case "${ACTION}" in
+  add)
+    # there's CNAME already mapped, but might not be to the correct target
+    if [[ ${uci_target_exists} -eq 0 ]]; then
+      log warn "Add ACTION: a UCI entry exists with target '${uci_target_domain}'"
+      
+      # there is a preferred target and the CNAME record is already pointing to it so nothing to do
+      if [[ ${map_pref_target_exists} -eq 0 ]] && [[ ${map_pref_target} == "${uci_target}" ]]; then
+        log warn "Add ACTION SKIPPED: CNAME '${map_cname_domain}' is already mapped to the preferred target '${map_pref_target_domain}'"
+        exit 0
+      fi
+
+      # there is a prefeerred target but the CNAME record is not pointing to it so we update to do so
+      if [[ ${map_pref_target_exists} -eq 0 ]]; then
+        log warn "Add ACTION updating existing CNAME '${map_cname_domain}' to use preferred target override '${map_pref_target_domain}' instead of '${uci_target_domain}'"
+        update "${map_cname_domain}" "${uci_target_domain}" "${map_pref_target_domain}" "${uci_target_index}"
+      fi
+
+      if [[ ${uci_target} == "${env_target}" ]]; then
+        log warn "Add ACTION SKIPPED: CNAME '${map_cname_domain}' is already mapped to the target '${env_target_domain}'"
+        exit 0
+      fi
+
+      log warn "Add ACTION updating existing CNAME '${map_cname_domain}' to use the new env target '${env_target_domain}' instead of ${uci_target_domain}"
+      update "${map_cname_domain}" "${uci_target_domain}" "${env_target_domain}" "${uci_target_index}"
+    fi
+
+    # exit if the target is not up, but try more due to add race condition
+    if ! ping -4 -c 4 "${env_target_domain}">/dev/null; then
+      log warn "Add ACTION SKIPPED: CNAME '${map_cname_domain}' env target host '${env_target_domain}' is not reachable: exiting"
+      exit 0
+    else
+      log "Add ACTION: CNAME '${map_cname_domain}' env target host '${env_target_domain}' is reachable: proceeding with cname change"
+    fi
+
+    log "Add ACTION requested on non-existant CNAME entry '${map_cname_domain}': creating entry to point to '${env_target_domain}'"
+    create "${map_cname_domain}" "${env_target_domain}"
+    ;;
+  update)
+    # there's a CNAME already mapped, but it might not be to the correct target
+    if [[ ${uci_target_exists} -eq 0 ]]; then
+      log warn "Update ACTION: a UCI entry exists with target '${uci_target_domain}'"
+      
+      # there is a preferred target and the CNAME record is already pointing to it so nothing to do
+      if [[ ${map_pref_target_exists} -eq 0 ]] && [[ ${map_pref_target} == "${uci_target}" ]]; then
+        log warn "Update ACTION SKIPPED: CNAME '${map_cname_domain}' is already mapped to the preferred target '${map_pref_target_domain}'"
+        exit 0
+      fi
+
+      # there is a prefeerred target but the CNAME record is not pointing to it so we update to do so
+      if [[ ${map_pref_target_exists} -eq 0 ]] && host_up "${map_pref_target_domain}"; then
+        log warn "Update ACTION: updating existing CNAME '${map_cname_domain}' to use preferred target override '${map_pref_target_domain}' instead of '${uci_target_domain}'"
+        update "${map_cname_domain}" "${uci_target_domain}" "${map_pref_target_domain}" "${uci_target_index}"
+      fi
+
+      if [[ ${uci_target} == "${env_target}" ]]; then
+        log warn "Update ACTION SKIPPED: CNAME '${map_cname_domain}' is already mapped to the target '${env_target_domain}'"
+        exit 0
+      fi
+
+      log warn "Update ACTION updating existing CNAME '${map_cname_domain}' to use the new env target '${env_target_domain}' instead of old '${uci_target_domain}'"
+      
+      if host_up "${env_target_domain}"; then
+        update "${map_cname_domain}" "${uci_target_domain}" "${env_target_domain}" "${uci_target_index}"
+      else
+        log warn "Update ACTION: skipped update of CNAME '${map_cname_domain}' from old '${uci_target_domain}' to new '${env_target_domain}' since the new host is not reachable"
+      fi
+    fi
+
+    # exit if the target is not up, but try more due to add race condition
+    if ! host_up "${env_target_domain}"; then
+      log warn "Update ACTION SKIPPED: CNAME '${map_cname_domain}' env target host '${env_target_domain}' is not reachable: exiting"
+      exit 0
+    else
+      log "Update ACTION: CNAME '${map_cname_domain}' env target host ${env_target_domain} is reachable: proceeding with cname change"
+    fi
+
+    log "Update ACTION requested on non-existant CNAME entry '${map_cname_domain}': creating entry"
+    create "${map_cname_domain}" "${env_target_domain}"
+    ;;
+  remove)
+    # there's a CNAME already mapped, but it might not be to the correct target
+    if [[ ${uci_target_exists} -eq 0 ]]; then
+      log warn "Remove ACTION: a UCI entry exists with target '${uci_target_domain}'"
+      
+      # there is a reachable preferred target and the CNAME record is already pointing to it, so lets not delete it
+      if [[ ${map_pref_target_exists} -eq 0 ]] && [[ ${map_pref_target} == "${uci_target}" ]]; then
+        log warn "Remove ACTION SKIPPED: CNAME '${map_cname_domain}' is already mapped to the reachable preferred target '${map_pref_target_domain}'"
+        exit 0
+      fi
+
+      # there is a reachable preferred target but the CNAME record is not pointing to it so we do an update instead of deleting the record
+      if [[ ${map_pref_target_exists} -eq 0 ]]; then
+        log warn "Remove ACTION: updating existing CNAME '${map_cname_domain}' to use preferred target override '${map_pref_target_domain}' instead of '${env_target_domain}'"
+        update "${map_cname_domain}" "${uci_target_domain}" "${map_pref_target_domain}" "${uci_target_index}"
+      fi
+
+      if [[ ${uci_target} == "${env_target}" ]]; then
+        log warn "Remove ACTION: deleting CNAME '${map_cname_domain}' mapped to the env target '${env_target_domain}'"
+        delete "${uci_target_index}"
+      fi
+
+      log warn "Remove ACTION: existing CNAME '${map_cname_domain}' DOES NOT point to the env target '${env_target_domain}'"
+      if ! host_up "${uci_target_domain}"; then
+        delete "${uci_target_domain}"
+      else
+        log "Remove ACTION SKIPPED: the CNAME record '${map_cname_domain}' points to a reachable target '${uci_target_domain}'"
+        exit 0
+      fi
+    fi
+
+    log warn "Remove ACTION SKIPPED: NO CNAME found for '${map_cname_domain}'"
+    exit 0
+    ;;
+  *)
+    log "case unkown"
+    log fatal "Unknown ACTION type: ${ACTION}"
+    exit 1
+    ;;
+esac

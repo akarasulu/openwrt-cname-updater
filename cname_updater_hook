@@ -1,0 +1,7 @@
+#!/bin/sh
+
+ACTION="${ACTION}"      \
+HOSTNAME="${HOSTNAME}"  \
+MACADDR="${MACADDR}"    \
+IPADDR="${IPADDR}"      \
+bash -c '/usr/share/cname_updater/cname_updater'

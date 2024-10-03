@@ -1,0 +1,351 @@
+# shellcheck disable=SC2148
+
+
+lock() {
+  flock -x "${FD}"
+  log "LOCKED: ${LOCK_FILE}"
+}
+
+
+unlock() {
+  flock -u "${FD}"
+  log "UNLOCKED: ${LOCK_FILE}"
+}
+
+
+restart() {
+  echo 'service dnsmasq restart' | tee "$(cat /tmp/debounce_dnsmasq_restart)"/fifo
+  log "Sent request to dnsmasq_restart debounce instance"
+}
+
+
+revert() {
+  local err_msg="${1:?'Error message argument NOT provided to revert() function'}"
+  local changes
+  
+  changes="$(uci changes dhcp)"
+  log error "revert(): changes '${changes}'"
+  log error "${err_msg}"
+
+  if [[ -z ${changes} ]]; then
+    log warn "No changes to revert"
+  elif uci revert dhcp; then
+    log "Successfully reverted dhcp database changes"
+  else
+    log error "Failed to revert dhcp changes"
+  fi
+
+  log error "Exiting with error"
+  exit 1
+}
+
+
+count() {
+  local cname="${1:?'count(): no cname argument provided'}"
+  [[ ! ${cname} =~ .*\.${DOMAIN} ]] && cname="${cname}.${HOSTNAME}"
+  local uci_option="option cname '${cname}'"
+  local val ret
+  val="$(grep -c "${uci_option}" /etc/config/dhcp)"
+  ret=$?
+  [[ ${ret} -eq 1 ]] && [[ ${val} -eq 0 ]] && echo 0 && return 0
+  [[ ${ret} -gt 1 ]] && return 1
+  echo "${val}"
+}
+
+
+update() {
+  local cname=${1:?'update(): Missing first CNAME name argument'}
+  local old_target=${2:?'update(): Missing second CNAME old target argument'}
+  local new_target=${3:?'update(): Missing third CNAME new target argument'}
+  local index=${4:?'update(): Missing fourth UCI CNAME record index argument'}
+
+  if ! uci set dhcp.@cname["${index}"].target="${new_target}"; then
+    revert "update(): Failed on uci set dhcp.@cname[${index}].target=${new_target} operation for CNAME '${cname}'"
+  else
+    log warn "update(): updated CNAME entry '${cname}' from old target '${old_target}' to new target to '${new_target}' succeeded"
+  fi
+
+  if ! uci commit dhcp; then
+    revert "Failed on uci commit dhcp operation for CNAME ${cname} from old target '${old_target}' to new target '${new_target}'"
+  else
+    log "Succeeded on uci commit dhcp operation"
+    unlock
+    restart
+    exit 0
+  fi
+}
+
+
+delete() {
+  local cname=${1:?'update(): Missing first CNAME name argument'}
+  local target=${2:?'update(): Missing second CNAME target argument'}
+  local index=${3:?'update(): Missing third UCI CNAME record index argument'}
+
+  if uci delete dhcp.@cname["${index}"]; then
+    log "Deleted CNAME: '${cname}'==>'${target}'"
+    if ! uci commit dhcp; then
+      revert "Failed on uci commit dhcp operation to remove '${cname}'==>'${target}'"
+    else
+      log warn "Succeeded on uci commit dhcp for CNAME operation to remove '${cname}'==>'${target}'"
+      unlock
+      restart
+      exit 0
+    fi
+  else
+    revert "FAILED TO DELETE CNAME: '${cname}'==>'${target}'"
+  fi
+}
+
+
+create() {
+  local cname="${1:?'create(): Missing first CNAME name argument'}"
+  local target="${2:?'create(): Missing second CNAME target argument'}"
+  local count
+  log "create(): invoked"
+
+  count="$(count "${cname}")"
+  if [[ ${count} -gt 0 ]]; then
+    log "create(): Exiting, the CNAME '${cname}' record count (${count}) is greater than 0"
+    unlock
+    exit 1
+  fi
+
+  if ! uci add dhcp cname; then
+    revert 'Failed on uci add dhcp cname operation'
+  else
+    log "Succeeded on uci add dhcp cname operation"
+  fi
+
+  if ! uci set dhcp.@cname[-1].cname="${cname}"; then
+    revert "Failed on uci set dhcp.@cname[-1].cname=${cname} operation"
+  else
+    log "Succeeded on uci set dhcp.@cname[-1].cname=${cname} operation"
+  fi
+
+  if ! uci set dhcp.@cname[-1].target="${target}"; then
+    revert "Failed on set dhcp.@cname[-1].target=${target} operation"
+  else
+    log "Succeeded on set dhcp.@cname[-1].target=${target} operation"
+  fi
+
+  if ! uci commit dhcp; then
+    revert "Failed on uci commit dhcp operation"
+  else
+    log "Succeeded on uci commit dhcp operation"
+    unlock
+    restart
+    exit 0
+  fi
+}
+
+
+# Looks up the preferred CNAME mapping to use given a CNAME pointer's cname
+# -----------------------------------------------------------------------------
+# First arg is the CNAME record's cname field (i.e. maxwell)
+# Second arg is the intended CNAME target (i.e. maxwell-bigsur-wifi)
+#
+# Loops through all mappings one by one from the start. Only mappings with the
+# input target and target-wifi. If the targets of such matching CNAME names
+# start with the supplied target, then the target name is returned if the
+# target is reachable: essentially can be ping'd.
+#
+# shellcheck disable=SC2317
+pref_mapping() {
+  local cname target
+  local in_cname="${1:?'pref_mapping(): No first CNAME name argument provided'}"
+  local in_target="${2?'pref_mapping(): No second target name argument provided'}"
+  local in_action="${3?'pref_mapping(): No third action argument provided'}"
+  local in_target_wifi
+
+  if [[ ${in_target} =~ .*'-wifi'$ ]]; then
+    in_target_wifi="${in_target}"
+    in_target="${in_target%-wifi}"
+  else
+    in_target_wifi="${in_target}-wifi"
+  fi
+
+  log "pref_mapping(): (${in_action} action) Searching for CNAME '${in_cname}': wired target '${in_target}', and wireless target ${in_target_wifi}"
+  while read -r target cname; do
+    if [[ ${target} == "${in_target}" ]] || [[ ${target} == "${in_target_wifi}" ]]; then
+      if [[ ${cname} == "${in_cname}" ]]; then
+        log "pref_mapping(): Matched CNAME '${cname}' ==> '${target}', checking reachability"
+
+        case "${ACTION}" in
+          add)
+            if ! ping -4 -c 4 "${target}.${DOMAIN}" >/dev/null; then
+              log warn "pref_mapping(): (add action) CNAME '${cname}' ==> '${target}' is down, skipping target"
+              continue
+            else
+              log "pref_mapping(): (add action) CNAME '${cname}' ==> '${target}' is up, returning as pref mapping target"
+              echo "${target}"
+              return 0
+            fi
+            ;;
+          update)
+            if ! host_up "${target}.${DOMAIN}" >/dev/null; then
+              log warn "pref_mapping(): (update action) CNAME '${cname}' ==> '${target}' is down, skipping target"
+              continue
+            else
+              log "pref_mapping(): (update action) CNAME '${cname}' ==> '${target}' is up, returning as pref mapping target"
+              echo "${target}"
+              return 0
+            fi
+            ;;
+          remove)
+            # dnsmasq request to remove the wired connection
+            if [[ ${2} == "${in_target}" ]]; then
+              log "pref_mapping(): (remove action) Before removing CNAME to '${in_target}', check for wireless access"
+
+              # check wireless as alternative
+              if host_up "${in_target_wifi}"; then
+                log warn "pref_mapping(): (remove action) on wired '${in_target}', but wireless target '${in_target_wifi}' is reachable, returning it as the preferred target"
+                echo "${in_target_wifi}"
+                return 0
+              else
+                log warn "pref_mapping(): (remove action) on wired '${in_target}', and wireless target '${in_target_wifi}' is down, return unsuccessfully without target"
+                return 1
+              fi
+            # dnsmasq request to remove the wireless connection
+            else
+              log "pref_mapping(): (remove action) Before removing CNAME to '${in_target_wifi}', check for wired access"
+
+              if host_up "${in_target}"; then
+                log warn "pref_mapping(): (remove action) on wireless '${in_target_wifi}', but wired '${in_target}' is reachable, returning wired as preferred target"
+                echo "${in_target}"
+                return 0
+              else
+                log warn "pref_mapping(): (remove action) on wireless '${in_target_wifi}', and wired '${in_target}' is down, return unsuccessfully without target"
+                return 1
+              fi
+            fi
+            ;;
+          *)
+            log error "Uknown action type ${in_action}, exiting with error"
+            exit 1
+            ;;
+        esac
+      fi
+    fi
+  done<"${MAPPINGS}"
+
+  return 1
+}
+
+
+host_up() {
+  local host=${1:?'No first host argument provided'}
+  ping -q -4 -c 1 -W 1 "${host}">/dev/null
+}
+
+
+# Looks up CNAME target in the UCI database when provided with a CNAME name
+# -----------------------------------------------------------------------------
+# First argument is a CNAME name with a domain suffix (added if missing)
+# Prints the target name with its domain suffix if successful
+# Returns 0 on success, 1 on failure
+# NOTE: check enforces ONLY one CNAME name record in the uci dhcp database
+
+
+uci_target() {
+  local entry_cname entry_target
+  local idx=0
+  local found_entry=0
+  local cname="${1:?'uci_target(): no cname argument provided'}"
+  
+  if [[ ! ${cname} =~ .*\.${DOMAIN} ]]; then
+    log warn "uci_target(): added missing domain suffix ${DOMAIN} to cname '${cname}' argument"
+    cname="${cname}.${HOSTNAME}"
+  else
+    log "uci_target(): CNAME with domain name suffix ${cname} provided"
+  fi
+
+  log debug "uci_target(): entering loop"
+  while true; do
+    entry_cname="$(uci get dhcp.@cname["${idx}"].cname 2>/dev/null)"
+    found_entry=$?
+
+    if [[ ${found_entry} -ne 0 ]]; then
+      log "uci_target(): Exhausted CNAME entries at index ${idx} while searching for '${cname}'"
+      return 1
+    else
+      log debug "uci_target(): Found CNAME entry for '${entry_cname}' at index ${idx} while searching for '${cname}'"
+    fi
+
+    if [[ ${entry_cname} == "${cname}" ]]; then
+      entry_target="$(uci get dhcp.@cname["${idx}"].target)"
+      log "uci_target(): Found matching CNAME entry '${entry_cname}' with target set to '${entry_target}'"
+      printf '%s %d\n' "${entry_target}" "${idx}"
+      return 0
+    else
+      log debug "uci_target(): Entry ${entry_cname} does not match ${cname}, skipping"
+    fi
+    
+    # shellcheck disable=SC2219
+    let "idx=idx+1"
+  done
+}
+
+
+log() {
+  local msg tag priority
+  # shellcheck disable=SC2235
+  ( [[ ${#} -eq 0 ]] || [[ ${LOGOFF} == 'yes' ]] ) && return
+  if [[ ${#} -eq 1 ]]; then
+    msg="${1}" && tag=info &&  priority=2
+  else
+    msg="${2}" && tag="${1}" && priority="${log_priorities[${tag}]}"
+  fi
+  [[ -z ${priority} ]] && tag=info && priority=2 && msg=${1}
+
+  if [[ ${priority} -ge ${cfg_priority} ]]; then
+    printf '%s [%s] %s\n' "$(date +%s)" "${tag}" "${msg}" >> "${OUT}"
+  fi
+}
+
+
+
+if [[ ! -v logpri ]]; then
+  [[ -n ${1} ]] && logpri="${1}"
+  [[ -z ${1} ]] && logpri=debug
+fi
+
+LOGDIR=/tmp
+LOGOFF=no
+
+if [[ -v HOSTNAME ]] && [[ -v ACTION ]]; then
+  OUT="$(mktemp -p ${LOGDIR} -t "$(date +%s)_${HOSTNAME}_${ACTION}"_cname_updater.XXXXXX)"
+elif [[ -v CNAME_REAPER ]]; then
+  OUT="/tmp/log/cname_reaper.log"
+fi
+
+declare -A log_priorities
+log_priorities=( 
+  ["trace"]="0"
+  ["debug"]="1"
+  ["info"]="2"
+  ["warning"]="3"
+  ["warn"]="3"
+  ["err"]="4"
+  ["error"]="4"
+  ["fatal"]="5"
+)
+cfg_priority=${log_priorities[${logpri}]}
+[[ -z ${cfg_priority} ]] && echo "Invalid logpri '${logpri}': existing ..." && exit 1
+
+LOCK_FILE=/tmp/run/dnsmasq/cname_updater.lock
+FD=0
+while [[ ${FD} -le 254 ]]; do
+  link="/proc/${$}/fd/${FD}"
+  if [[ ! -L "${link}" ]]; then
+    echo "${FD}"
+    break
+  fi
+  # shellcheck disable=SC2219
+  let "FD=FD+1"
+done
+exec"${FD}">"${LOCK_FILE}"
+
+MAPPINGS=/etc/cname_mappings
+DOMAIN="$(uci show dhcp.@dnsmasq[0].domain | sed -e "s/'//g" -e 's/^dhcp\..*\.domain=//')"
+
+log "Logging and locking enabled with all functions..."
